@@ -27,7 +27,6 @@ SCALE = 2
 TILE_SIZE = 16
 SCALED = TILE_SIZE * SCALE  # 32
 
-PALETTE_COLS = 32
 DEFAULT_MAP_W = 32
 DEFAULT_MAP_H = 24
 
@@ -54,8 +53,10 @@ class TileEditorApp:
         # Data
         self.tile_list: list[dict] = []       # from tile_index.json
         self.tags: dict[str, dict] = {}       # tile_id -> {category, description, edges}
-        self.images: dict[str, ImageTk.PhotoImage] = {}  # tile_id -> scaled PhotoImage
-        self.pil_images: dict[str, Image.Image] = {}     # tile_id -> PIL Image (scaled)
+        self.images: dict[str, ImageTk.PhotoImage] = {}  # tile_id -> scaled PhotoImage (palette)
+        self.pil_images: dict[str, Image.Image] = {}     # tile_id -> PIL Image (palette scale)
+        self.pil_originals: dict[str, Image.Image] = {}  # tile_id -> original 16x16 PIL Image
+        self.map_images: dict[str, ImageTk.PhotoImage] = {}  # tile_id -> map-zoom PhotoImage
         self.gid_to_tile_id: dict[int, str] = {}
         self.selected_tile: str | None = None
         self.grid: list[list[int]] = []       # map grid[row][col] = gid (0=empty)
@@ -64,6 +65,14 @@ class TileEditorApp:
         self.palette_tile_ids: list[str] = []  # currently displayed tile ids in palette
         self.adjacency: dict = {}             # from tile_adjacency.json
         self.tile_id_to_gid: dict[str, int] = {}
+        self.zoom_level: int = SCALE          # current map zoom (default=2)
+
+        # Transform state for tile placement
+        self.current_rotation: int = 0          # 0, 90, 180, 270
+        self.current_flip_h: bool = False       # horizontal flip
+        self.current_flip_v: bool = False       # vertical flip
+        self.transform_grid: list[list[tuple[int, bool, bool]]] = []  # per-cell (rot, fh, fv)
+        self._transform_cache: dict[tuple, ImageTk.PhotoImage] = {}   # (tile_id, zoom, rot, fh, fv)
 
         self._load_data()
         self._build_menu()
@@ -110,9 +119,13 @@ class TileEditorApp:
             img_path = TILES_DIR / t["filename"]
             if img_path.exists():
                 pil = Image.open(img_path).convert("RGBA")
+                self.pil_originals[tile_id] = pil
                 pil_scaled = pil.resize((SCALED, SCALED), Image.NEAREST)
                 self.pil_images[tile_id] = pil_scaled
                 self.images[tile_id] = ImageTk.PhotoImage(pil_scaled)
+
+        # Build map-zoom images at initial zoom level
+        self._rebuild_map_images()
 
     # ─── Menu ────────────────────────────────────────────────────────
 
@@ -141,22 +154,28 @@ class TileEditorApp:
     # ─── UI layout ───────────────────────────────────────────────────
 
     def _build_ui(self):
-        main = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        main = ttk.Frame(self.root)
         main.pack(fill=tk.BOTH, expand=True)
+        main.grid_columnconfigure(0, weight=0, minsize=300)
+        main.grid_columnconfigure(1, weight=1)
+        main.grid_columnconfigure(2, weight=0, minsize=280)
+        main.grid_rowconfigure(0, weight=1)
 
         # Left: palette
         left = ttk.Frame(main, width=300)
-        main.add(left, weight=0)
+        left.grid(row=0, column=0, sticky="nsew")
+        left.grid_propagate(False)
         self._build_palette(left)
 
         # Center: map canvas
         center = ttk.Frame(main)
-        main.add(center, weight=1)
+        center.grid(row=0, column=1, sticky="nsew")
         self._build_canvas(center)
 
         # Right: tag editor
         right = ttk.Frame(main, width=280)
-        main.add(right, weight=0)
+        right.grid(row=0, column=2, sticky="nsew")
+        right.grid_propagate(False)
         self._build_tag_editor(right)
 
         # Unified mouse-wheel scroll: route to whichever scrollable canvas
@@ -164,12 +183,37 @@ class TileEditorApp:
         self._hover_canvas: tk.Canvas | None = None
         self.palette_canvas.bind("<Enter>", lambda e: self._set_hover(self.palette_canvas))
         self.palette_canvas.bind("<Leave>", lambda e: self._set_hover(None))
+        self.map_canvas.bind("<Enter>", lambda e: self._set_hover(self.map_canvas))
+        self.map_canvas.bind("<Leave>", lambda e: self._set_hover(None))
         self._tag_canvas.bind("<Enter>", lambda e: self._set_hover(self._tag_canvas))
         self._tag_canvas.bind("<Leave>", lambda e: self._set_hover(None))
 
         self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.root.bind_all("<Shift-MouseWheel>", self._on_mousewheel_h)
         self.root.bind_all("<Button-4>", self._on_mousewheel)
         self.root.bind_all("<Button-5>", self._on_mousewheel)
+        self.root.bind_all("<Shift-Button-4>", self._on_mousewheel_h)
+        self.root.bind_all("<Shift-Button-5>", self._on_mousewheel_h)
+
+        # Zoom: Cmd+scroll (Mac) / Ctrl+scroll (others)
+        zoom_mod = "Command" if IS_MAC else "Control"
+        self.root.bind_all(f"<{zoom_mod}-MouseWheel>", self._on_zoom)
+        self.root.bind_all(f"<{zoom_mod}-Button-4>", self._on_zoom)
+        self.root.bind_all(f"<{zoom_mod}-Button-5>", self._on_zoom)
+
+        # Transform shortcuts: R (rotate), H (flip horizontal), V (flip vertical)
+        # Skip if focus is on a text entry widget
+        def _key_if_not_entry(func):
+            def handler(e):
+                w = e.widget
+                if isinstance(w, (tk.Entry, ttk.Entry, ttk.Combobox)):
+                    return
+                func()
+            return handler
+
+        self.root.bind_all("<r>", _key_if_not_entry(self._cycle_rotation))
+        self.root.bind_all("<h>", _key_if_not_entry(self._toggle_flip_h))
+        self.root.bind_all("<v>", _key_if_not_entry(self._toggle_flip_v))
 
     def _set_hover(self, canvas: tk.Canvas | None):
         self._hover_canvas = canvas
@@ -182,7 +226,144 @@ class TileEditorApp:
         elif event.num == 5:
             self._hover_canvas.yview_scroll(3, "units")
         elif event.delta:
-            self._hover_canvas.yview_scroll(-1 * (event.delta // 120), "units")
+            if IS_MAC:
+                self._hover_canvas.yview_scroll(-event.delta, "units")
+            else:
+                self._hover_canvas.yview_scroll(-1 * (event.delta // 120), "units")
+
+    def _on_mousewheel_h(self, event):
+        if self._hover_canvas is None:
+            return
+        if event.num in (4,):
+            self._hover_canvas.xview_scroll(-3, "units")
+        elif event.num in (5,):
+            self._hover_canvas.xview_scroll(3, "units")
+        elif event.delta:
+            if IS_MAC:
+                self._hover_canvas.xview_scroll(-event.delta, "units")
+            else:
+                self._hover_canvas.xview_scroll(-1 * (event.delta // 120), "units")
+
+    def _on_zoom(self, event):
+        """Handle Cmd/Ctrl+scroll to zoom the map canvas."""
+        if self._hover_canvas is not self.map_canvas:
+            return
+        if event.num == 4 or (event.delta and event.delta > 0):
+            new_zoom = min(self.zoom_level + 1, 8)
+        elif event.num == 5 or (event.delta and event.delta < 0):
+            new_zoom = max(self.zoom_level - 1, 1)
+        else:
+            return
+        if new_zoom != self.zoom_level:
+            self.zoom_level = new_zoom
+            self._rebuild_map_images()
+            self._render_grid()
+
+    def _rebuild_map_images(self):
+        """Rebuild map tile images at current zoom level."""
+        sz = TILE_SIZE * self.zoom_level
+        self.map_images.clear()
+        self._transform_cache.clear()
+        for tile_id, pil in self.pil_originals.items():
+            scaled = pil.resize((sz, sz), Image.NEAREST)
+            self.map_images[tile_id] = ImageTk.PhotoImage(scaled)
+
+    # ─── Transform helpers ───────────────────────────────────────────
+
+    def _cycle_rotation(self):
+        self.current_rotation = (self.current_rotation + 90) % 360
+        self._update_transform_label()
+
+    def _toggle_flip_h(self):
+        self.current_flip_h = not self.current_flip_h
+        self._update_transform_label()
+
+    def _toggle_flip_v(self):
+        self.current_flip_v = not self.current_flip_v
+        self._update_transform_label()
+
+    def _update_transform_label(self):
+        parts = [f"R{self.current_rotation}"]
+        if self.current_flip_h:
+            parts.append("H")
+        if self.current_flip_v:
+            parts.append("V")
+        self.transform_var.set("Transform: " + " ".join(parts))
+        # Update preview if a tile is selected
+        if self.selected_tile:
+            self._show_tile_tags(self.selected_tile)
+
+    def _get_transformed_image(self, tile_id: str, zoom: int, rotation: int, flip_h: bool, flip_v: bool) -> ImageTk.PhotoImage | None:
+        """Get a transformed tile image, using cache."""
+        key = (tile_id, zoom, rotation, flip_h, flip_v)
+        if key in self._transform_cache:
+            return self._transform_cache[key]
+        pil = self.pil_originals.get(tile_id)
+        if pil is None:
+            return None
+        # Apply transforms: flip_h -> flip_v -> rotate
+        if flip_h:
+            pil = pil.transpose(Image.FLIP_LEFT_RIGHT)
+        if flip_v:
+            pil = pil.transpose(Image.FLIP_TOP_BOTTOM)
+        if rotation:
+            pil = pil.rotate(-rotation, expand=False)
+        sz = TILE_SIZE * zoom
+        pil = pil.resize((sz, sz), Image.NEAREST)
+        photo = ImageTk.PhotoImage(pil)
+        self._transform_cache[key] = photo
+        return photo
+
+    def _has_transform(self, rotation: int, flip_h: bool, flip_v: bool) -> bool:
+        return rotation != 0 or flip_h or flip_v
+
+    @staticmethod
+    def _transform_to_flags(rotation: int, flip_h: bool, flip_v: bool) -> str:
+        """Convert editor (rotation, flip_h, flip_v) to Tiled-style flag string.
+
+        Tiled flag semantics:
+          H = horizontal flip, V = vertical flip, D = diagonal flip (transpose)
+          HD  = 90° CW rotation
+          HV  = 180° rotation
+          VD  = 270° CW (= 90° CCW) rotation
+
+        When rotation and flips combine, we compose the underlying transforms
+        and re-derive H/V/D flags.
+        """
+        # Start with identity: (h_flip, v_flip, diagonal)
+        h, v, d = False, False, False
+
+        # Apply rotation first (as Tiled flag combinations)
+        if rotation == 90:
+            h, d = True, True        # HD
+        elif rotation == 180:
+            h, v = True, True        # HV
+        elif rotation == 270:
+            v, d = True, True        # VD
+
+        # Compose additional flip_h (toggles H flag)
+        if flip_h:
+            h = not h
+        # Compose additional flip_v (toggles V flag)
+        if flip_v:
+            v = not v
+
+        flags = ""
+        if h:
+            flags += "H"
+        if v:
+            flags += "V"
+        if d:
+            flags += "D"
+        return flags
+
+    @staticmethod
+    def _tile_key(gid: int, rotation: int, flip_h: bool, flip_v: bool) -> str:
+        """Build a tile_adjacency-compatible key like '170' or '170:HV'."""
+        flags = TileEditorApp._transform_to_flags(rotation, flip_h, flip_v)
+        if flags:
+            return f"{gid}:{flags}"
+        return str(gid)
 
     # ─── Palette (left) ─────────────────────────────────────────────
 
@@ -207,21 +388,29 @@ class TileEditorApp:
         search_entry.pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
         self.search_var.trace_add("write", lambda *_: self._refresh_palette())
 
-        # Scrollable canvas for tiles
+        # Scrollable canvas for tiles (both vertical and horizontal)
         container = ttk.Frame(parent)
         container.pack(fill=tk.BOTH, expand=True)
 
         self.palette_canvas = tk.Canvas(container, bg="#333333")
-        scrollbar = ttk.Scrollbar(container, orient=tk.VERTICAL, command=self.palette_canvas.yview)
-        self.palette_canvas.configure(yscrollcommand=scrollbar.set)
+        v_scrollbar = ttk.Scrollbar(container, orient=tk.VERTICAL, command=self.palette_canvas.yview)
+        h_scrollbar = ttk.Scrollbar(container, orient=tk.HORIZONTAL, command=self.palette_canvas.xview)
+        self.palette_canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
 
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
         self.palette_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self.palette_inner = ttk.Frame(self.palette_canvas)
         self.palette_canvas.create_window((0, 0), window=self.palette_inner, anchor="nw")
         self.palette_inner.bind("<Configure>",
                                 lambda e: self.palette_canvas.configure(scrollregion=self.palette_canvas.bbox("all")))
+
+        # Transform status label
+        self.transform_var = tk.StringVar(value="Transform: R0")
+        transform_lbl = ttk.Label(parent, textvariable=self.transform_var, font=("", 10, "bold"))
+        transform_lbl.pack(fill=tk.X, padx=4, pady=(4, 2))
+        ttk.Label(parent, text="R: Rotate  H: Flip H  V: Flip V", font=("", 8)).pack(fill=tk.X, padx=4, pady=(0, 4))
 
         self._refresh_palette()
 
@@ -232,7 +421,7 @@ class TileEditorApp:
         cat = self.cat_filter_var.get()
         search = self.search_var.get().lower().strip()
 
-        filtered = []
+        filtered: list[dict] = []
         for t in self.tile_list:
             tid = t["id"]
             tag = self.tags.get(tid, {})
@@ -242,13 +431,14 @@ class TileEditorApp:
                 desc = tag.get("description", "").lower()
                 if search not in tid.lower() and search not in desc:
                     continue
-            filtered.append(tid)
+            filtered.append(t)
 
-        self.palette_tile_ids = filtered
+        self.palette_tile_ids = [t["id"] for t in filtered]
         self.palette_labels: dict[str, tk.Label] = {}
 
-        for i, tid in enumerate(filtered):
-            r, c = divmod(i, PALETTE_COLS)
+        for t in filtered:
+            tid = t["id"]
+            r, c = t["row"], t["col"]
             if tid in self.images:
                 lbl = tk.Label(self.palette_inner, image=self.images[tid],
                                bd=1, relief=tk.FLAT, bg="#333333")
@@ -292,6 +482,12 @@ class TileEditorApp:
         self.map_canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self.map_canvas.bind("<Button-3>", self._on_canvas_right_click)
         self.map_canvas.bind("<B3-Motion>", self._on_canvas_right_click)
+        if IS_MAC:
+            self.map_canvas.bind("<Button-2>", self._on_canvas_right_click)
+            self.map_canvas.bind("<B2-Motion>", self._on_canvas_right_click)
+            self.map_canvas.bind("<Control-Button-1>", self._on_canvas_right_click)
+            self.map_canvas.bind("<Option-Button-1>", self._on_canvas_right_click)
+            self.map_canvas.bind("<Option-B1-Motion>", self._on_canvas_right_click)
 
     def _on_canvas_click(self, event):
         self._place_tile(event)
@@ -302,8 +498,9 @@ class TileEditorApp:
     def _place_tile(self, event):
         if not self.selected_tile:
             return
-        col = int(self.map_canvas.canvasx(event.x)) // SCALED
-        row = int(self.map_canvas.canvasy(event.y)) // SCALED
+        sz = TILE_SIZE * self.zoom_level
+        col = int(self.map_canvas.canvasx(event.x)) // sz
+        row = int(self.map_canvas.canvasy(event.y)) // sz
         if 0 <= row < self.map_h and 0 <= col < self.map_w:
             # Find gid for selected tile
             gid = 0
@@ -311,39 +508,51 @@ class TileEditorApp:
                 if t["id"] == self.selected_tile:
                     gid = t["gid"]
                     break
-            if gid and self.grid[row][col] != gid:
+            new_transform = (self.current_rotation, self.current_flip_h, self.current_flip_v)
+            if gid and (self.grid[row][col] != gid or self.transform_grid[row][col] != new_transform):
                 self.grid[row][col] = gid
+                self.transform_grid[row][col] = new_transform
                 self._render_cell(row, col)
 
     def _on_canvas_right_click(self, event):
-        col = int(self.map_canvas.canvasx(event.x)) // SCALED
-        row = int(self.map_canvas.canvasy(event.y)) // SCALED
+        sz = TILE_SIZE * self.zoom_level
+        col = int(self.map_canvas.canvasx(event.x)) // sz
+        row = int(self.map_canvas.canvasy(event.y)) // sz
         if 0 <= row < self.map_h and 0 <= col < self.map_w:
             if self.grid[row][col] != 0:
                 self.grid[row][col] = 0
+                self.transform_grid[row][col] = (0, False, False)
                 self._render_cell(row, col)
 
     def _render_grid(self):
+        sz = TILE_SIZE * self.zoom_level
         self.map_canvas.delete("all")
-        self.map_canvas.configure(scrollregion=(0, 0, self.map_w * SCALED, self.map_h * SCALED))
+        self.map_canvas.configure(scrollregion=(0, 0, self.map_w * sz, self.map_h * sz))
         self._cell_images: dict[tuple[int, int], int] = {}
 
         for row in range(self.map_h):
             for col in range(self.map_w):
-                x, y = col * SCALED, row * SCALED
+                x, y = col * sz, row * sz
                 # Grid lines
-                self.map_canvas.create_rectangle(x, y, x + SCALED, y + SCALED,
+                self.map_canvas.create_rectangle(x, y, x + sz, y + sz,
                                                   outline="#333333", fill="#1a1a1a", tags="grid")
                 gid = self.grid[row][col]
                 if gid != 0:
                     tid = self.gid_to_tile_id.get(gid)
-                    if tid and tid in self.images:
-                        img_id = self.map_canvas.create_image(x, y, anchor=tk.NW,
-                                                               image=self.images[tid], tags="tile")
-                        self._cell_images[(row, col)] = img_id
+                    if tid:
+                        rot, fh, fv = self.transform_grid[row][col]
+                        if self._has_transform(rot, fh, fv):
+                            img = self._get_transformed_image(tid, self.zoom_level, rot, fh, fv)
+                        else:
+                            img = self.map_images.get(tid)
+                        if img:
+                            img_id = self.map_canvas.create_image(x, y, anchor=tk.NW,
+                                                                   image=img, tags="tile")
+                            self._cell_images[(row, col)] = img_id
 
     def _render_cell(self, row: int, col: int):
-        x, y = col * SCALED, row * SCALED
+        sz = TILE_SIZE * self.zoom_level
+        x, y = col * sz, row * sz
         # Remove old tile image if any
         if (row, col) in self._cell_images:
             self.map_canvas.delete(self._cell_images[(row, col)])
@@ -352,10 +561,16 @@ class TileEditorApp:
         gid = self.grid[row][col]
         if gid != 0:
             tid = self.gid_to_tile_id.get(gid)
-            if tid and tid in self.images:
-                img_id = self.map_canvas.create_image(x, y, anchor=tk.NW,
-                                                       image=self.images[tid], tags="tile")
-                self._cell_images[(row, col)] = img_id
+            if tid:
+                rot, fh, fv = self.transform_grid[row][col]
+                if self._has_transform(rot, fh, fv):
+                    img = self._get_transformed_image(tid, self.zoom_level, rot, fh, fv)
+                else:
+                    img = self.map_images.get(tid)
+                if img:
+                    img_id = self.map_canvas.create_image(x, y, anchor=tk.NW,
+                                                           image=img, tags="tile")
+                    self._cell_images[(row, col)] = img_id
 
     # ─── Tag editor (right) ─────────────────────────────────────────
 
@@ -464,9 +679,16 @@ class TileEditorApp:
         self.neighbor_list_frame.pack(fill=tk.X)
 
     def _show_tile_tags(self, tile_id: str):
-        # Preview image (4x scale for preview)
-        if tile_id in self.pil_images:
-            preview = self.pil_images[tile_id].resize((64, 64), Image.NEAREST)
+        # Preview image (4x scale for preview) with current transform applied
+        if tile_id in self.pil_originals:
+            pil = self.pil_originals[tile_id]
+            if self.current_flip_h:
+                pil = pil.transpose(Image.FLIP_LEFT_RIGHT)
+            if self.current_flip_v:
+                pil = pil.transpose(Image.FLIP_TOP_BOTTOM)
+            if self.current_rotation:
+                pil = pil.rotate(-self.current_rotation, expand=False)
+            preview = pil.resize((64, 64), Image.NEAREST)
             self.preview_photo = ImageTk.PhotoImage(preview)
             self.preview_label.configure(image=self.preview_photo, width=64, height=64)
 
@@ -509,20 +731,24 @@ class TileEditorApp:
         BACKGROUND_GID = 1
         DIRECTIONS = [("right", 0, 1), ("bottom", 1, 0), ("left", 0, -1), ("top", -1, 0)]
 
-        # 1. Collect adjacency pairs from grid
+        # 1. Collect adjacency pairs from grid (with transform flags)
         new_adj: dict[str, dict[str, dict[str, int]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
         for r in range(self.map_h):
             for c in range(self.map_w):
                 gid = self.grid[r][c]
                 if gid == 0 or gid == BACKGROUND_GID:
                     continue
+                rot, fh, fv = self.transform_grid[r][c]
+                key = self._tile_key(gid, rot, fh, fv)
                 for direction, dr, dc in DIRECTIONS:
                     nr, nc = r + dr, c + dc
                     if 0 <= nr < self.map_h and 0 <= nc < self.map_w:
                         n_gid = self.grid[nr][nc]
                         if n_gid == 0 or n_gid == BACKGROUND_GID:
                             continue
-                        new_adj[str(gid)][direction][str(n_gid)] += 1
+                        n_rot, n_fh, n_fv = self.transform_grid[nr][nc]
+                        n_key = self._tile_key(n_gid, n_rot, n_fh, n_fv)
+                        new_adj[key][direction][n_key] += 1
 
         if not new_adj:
             messagebox.showinfo("Update Adjacency", "No adjacency pairs found in current map.\nPlace at least two non-background tiles next to each other.")
@@ -566,8 +792,12 @@ class TileEditorApp:
 
         for key in all_keys:
             if key not in tile_info:
-                gid = int(key)
-                info: dict = {"gid": gid, "flip": ""}
+                if ":" in key:
+                    gid_str, flags = key.split(":", 1)
+                else:
+                    gid_str, flags = key, ""
+                gid = int(gid_str)
+                info: dict = {"gid": gid, "flip": flags}
                 if gid in gid_to_tile_id:
                     info["tile_id"] = gid_to_tile_id[gid]
                 tile_info[key] = info
@@ -762,6 +992,7 @@ class TileEditorApp:
         self.map_w = w
         self.map_h = h
         self.grid = [[0] * w for _ in range(h)]
+        self.transform_grid = [[(0, False, False)] * w for _ in range(h)]
         self._cell_images = {}
         self._render_grid()
 
@@ -771,7 +1002,9 @@ class TileEditorApp:
                                             title="Save Map")
         if not path:
             return
-        data = {"width": self.map_w, "height": self.map_h, "grid": self.grid}
+        # Convert transform_grid tuples to serializable lists
+        transforms = [[list(cell) for cell in row] for row in self.transform_grid]
+        data = {"width": self.map_w, "height": self.map_h, "grid": self.grid, "transforms": transforms}
         Path(path).write_text(json.dumps(data, indent=2))
         messagebox.showinfo("Saved", f"Map saved to {path}")
 
@@ -783,6 +1016,11 @@ class TileEditorApp:
         self.map_w = data["width"]
         self.map_h = data["height"]
         self.grid = data["grid"]
+        # Load transforms (backward compatible — default to no transform)
+        if "transforms" in data:
+            self.transform_grid = [[tuple(cell) for cell in row] for row in data["transforms"]]
+        else:
+            self.transform_grid = [[(0, False, False)] * self.map_w for _ in range(self.map_h)]
         self._cell_images = {}
         self._render_grid()
 
