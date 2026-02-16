@@ -1,0 +1,7 @@
+tiles/
+tile_index.json
+tile_tags.json
+tile_tags_checkpoint.json
+__pycache__/
+*.pyc
+.DS_Store
