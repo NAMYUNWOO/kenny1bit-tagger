@@ -44,6 +44,34 @@ python tag_tiles.py --reset
 
 결과: `tile_tags.json`
 
+### 4. 인접 규칙 추출 (TMX 맵 기반)
+
+```bash
+python extract_adjacency.py
+python extract_adjacency.py --min-count 2   # 최소 2회 이상 관찰된 쌍만
+```
+
+`Tilemap/*.tmx` 샘플 맵에서 타일 인접 쌍을 수집하여 `tile_adjacency.json` 생성.
+Tiled flip flag(H/V/D)도 구분하여 방향별 이웃 빈도를 기록.
+
+### 5. 타일 에디터
+
+```bash
+python tile_editor.py
+```
+
+GUI 기반 타일 에디터:
+- **팔레트**: 카테고리/검색 필터로 타일 선택
+- **맵 캔버스**: 좌클릭 배치, 우클릭 삭제
+- **태그 편집**: 선택 타일의 카테고리/설명/edge 수정
+- **이웃 추천**: adjacency 데이터 기반 3×3 이웃 미리보기 + 방향별 Top-N 리스트
+- **맵→인접 규칙 갱신**: 에디터에서 배치한 맵으로 adjacency 데이터 누적 병합
+
+| 단축키 | 기능 |
+|--------|------|
+| `Ctrl+Shift+S` (`Cmd+Shift+S`) | 전체 태그 저장 |
+| `Ctrl+Shift+A` (`Cmd+Shift+A`) | 맵에서 인접 규칙 갱신 |
+
 ## 하드웨어별 예상 시간
 
 | GPU | 모델 | VRAM 사용 | 예상 시간 |
@@ -96,11 +124,14 @@ python tag_tiles.py --reset
 ## 파일 구조
 
 ```
-kenny1bit/
+kenny1bit-tagger/
 ├── README.md
+├── CLAUDE.md                # Claude Code 가이드
 ├── requirements.txt
-├── split_tiles.py           # 타일 분리
-├── tag_tiles.py             # VLM 태깅
+├── split_tiles.py           # Stage 1: 타일 분리
+├── tag_tiles.py             # Stage 2: VLM 태깅
+├── extract_adjacency.py     # Stage 3: TMX 맵에서 인접 규칙 추출
+├── tile_editor.py           # GUI 타일 에디터 + 태그 편집 + 인접 규칙 갱신
 ├── Tilemap/
 │   ├── tileset_legacy.png   # 소스 타일시트
 │   ├── tileset_colored.tsx  # Tiled 타일셋 정의
@@ -108,7 +139,8 @@ kenny1bit/
 ├── Tilesheet/               # 다른 형식의 타일시트
 ├── tiles/                   # (생성됨) 개별 타일 이미지
 ├── tile_index.json          # (생성됨) 타일 인덱스
-└── tile_tags.json           # (생성됨) 최종 태깅 결과
+├── tile_tags.json           # (생성됨) 최종 태깅 결과
+└── tile_adjacency.json      # (생성됨) 타일 인접 규칙
 ```
 
 ## 중단/재개
